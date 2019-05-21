@@ -33,7 +33,7 @@ DOCS_BASE='http://docs.wxPython.org'
 
 #----------------------------------------------------------------------
 
-NAME             = Nlv_version.PROJECT_NAME
+NAME             = 'Nlv_' + version.PROJECT_NAME
 DESCRIPTION      = "Cross platform GUI toolkit for Python, \"Phoenix\" version"
 AUTHOR           = "Robin Dunn"
 AUTHOR_EMAIL     = "robin@alldunn.com"
