@@ -27,12 +27,24 @@ import tarfile
 import tempfile
 import datetime
 
+try:
+    import pathlib
+except ImportError:
+    import buildtools.backports.pathlib2 as pathlib
+
+try:
+    from shutil import which
+except ImportError:
+    from buildtools.backports.shutil_which import which
+
+
 from distutils.dep_util import newer, newer_group
 from buildtools.config  import Config, msg, opj, posixjoin, loadETG, etg2sip, findCmd, \
                                phoenixDir, wxDir, copyIfNewer, copyFile, \
                                macSetLoaderNames, \
                                getVcsRev, runcmd, textfile_open, getSipFiles, \
-                               getVisCVersion, getToolsPlatformName, updateLicenseFiles
+                               getVisCVersion, getToolsPlatformName, updateLicenseFiles, \
+                               TemporaryDirectory
 
 import buildtools.version as version
 
@@ -70,17 +82,17 @@ baseName = version.PROJECT_NAME
 eggInfoName = baseName + '.egg-info'
 defaultMask='%s-%s*' % (baseName, version.VER_MAJOR)
 
-pyICON = 'docs/sphinx/_static/images/sphinxdocs/phoenix_title.png'
-wxICON = 'docs/sphinx/_static/images/sphinxdocs/mondrian.png'
+pyICON = 'packaging/docset/Vippi-blocks-icon-32.png'
+wxICON = 'packaging/docset/mondrian.png'
 
 # Some tools will be downloaded for the builds. These are the versions and
 # MD5s of the tool binaries currently in use.
-sipCurrentVersion = '4.19.13'
+sipCurrentVersion = '4.19.16'
 sipMD5 = {
-    'darwin'   : '2d2958a6f4cceebe5e4facb0114f9b0c',
-    'win32'    : '83cad605ae09a42440afdf89358c7f82',
-    'linux32'  : 'd9d2f8d1e897d2f238a5c49532d55933',
-    'linux64'  : '19f59f0bceb60dfd9b41f8e63b002492',
+    'darwin'   : 'ddb27cd807cc5474ce4d557f18b709dc',
+    'win32'    : 'e381c10b799a2bd130fceb330a149626',
+    'linux32'  : '6f5438ecaf38eef35380ff6652747f8b',
+    'linux64'  : 'e8566e05d2122344ec7ce0e289877f74',
 }
 
 wafCurrentVersion = '2.0.8'
@@ -257,7 +269,7 @@ def setPythonVersion(args):
             #
             TOOLS = os.environ.get('TOOLS')
             if 'cygdrive' in TOOLS:
-                TOOLS = runcmd(getCygwinPath()+'/bin/cygpath -w '+TOOLS, True, False)
+                TOOLS = bash2dosPath(TOOLS)
             use64flag = '--x64' in args
             if use64flag:
                 args.remove('--x64')
@@ -317,7 +329,7 @@ def setDevModeOptions(args):
     myDevModeOptions = [
             #'--build_dir=../bld',
             #'--prefix=/opt/wx/2.9',
-            '--jobs=6', #  % numCPUs(),
+            '--jobs=8', #  % numCPUs(),
 
             # These will be ignored on the other platforms so it is okay to
             # include them unconditionally
@@ -326,6 +338,7 @@ def setDevModeOptions(args):
             #'--osx_carbon',
             #'--mac_arch=i386',
             #'--mac_arch=i386,x86_64',
+            '--no_allmo',
             ]
     if not isWindows:
         myDevModeOptions.append('--debug')
@@ -436,6 +449,9 @@ def makeOptionParser():
         ("pytest_timeout", ("0",   "Timeout, in seconds, for stopping stuck test cases. (Currently not working as expected, so disabled by default.)")),
         ("pytest_jobs",    ("",    "Number of parallel processes py.test should run")),
         ("vagrant_vms",    ("all", "Comma separated list of VM names to use for the build_vagrant command. Defaults to \"all\"")),
+        ("dump_waf_log",   (False, "If the waf build tool fails then using this option will cause waf's configure log to be printed")),
+        ("regenerate_sysconfig", (False, "Waf uses Python's sysconfig and related tools to configure the build. In some cases that info can be incorrect, so this option regenerates it. Must have write access to Python's lib folder.")),
+        ("no_allmo",       (False, "Skip regenerating the wxWidgets message catalogs")),
         ]
 
     parser = optparse.OptionParser("build options:")
@@ -686,8 +702,8 @@ def uploadPackage(fileName, options, mask=defaultMask, keep=75):
     cmd = 'scp {} {}:{}'.format(fileName, host, uploadDir)
     runcmd(cmd)
 
-    # Make sure it is readable by all
-    cmd = 'ssh {} "cd {}; chmod a+r {}"'.format(host, uploadDir, os.path.basename(fileName))
+    # Make sure it is readable by all, and writable by rbot
+    cmd = 'ssh {} "cd {}; chmod 644 {}"'.format(host, uploadDir, os.path.basename(fileName))
     runcmd(cmd)
 
     if not options.release:
@@ -784,7 +800,7 @@ def checkCompiler(quiet=False):
     # we'll need to make this a little smarter about what flag (if any)
     # needs to be used.
     #
-    # NOTE 2: SIP chenged its output such that this doesn't appear to be
+    # NOTE 2: SIP changed its output such that this doesn't appear to be
     # needed anymore, but we'll leave the code in place to make it easy to
     # turn it back on again if/when needed.
     if False and not isWindows and not isDarwin:
@@ -805,22 +821,109 @@ def getWafBuildBase():
     return base
 
 
-def getCygwinPath():
+def getBashPath():
+    """Check if there is a bash.exe on the PATH"""
+    bash = which('bash.exe')
+    return bash
+
+
+def dos2bashPath(path):
     """
-    Try to locate the path where cygwin is installed.
-
-    If CYGWIN_BASE is set in the environment then use that. Otherwise look in
-    default install locations.
+    Convert an absolute dos-style path to one bash.exe can understand.
     """
-    if os.environ.get('CYGWIN_BASE'):
-        return os.environ.get('CYGWIN_BASE')
+    path = path.replace('\\', '/')
+    cygpath = which('cygpath')
+    wsl = which('wsl')
 
-    for path in ['c:/cygwin', 'c:/cygwin64']:
-        if os.path.isdir(path):
-            return path
+    # If we have cygwin then we can use cygpath to convert the path.
+    # Note that MSYS2 (and Git Bash) now also have cygpath so this should
+    # work there too.
+    if cygpath:
+        path = runcmd('"{}" -u "{}"'.format(cygpath, path), getOutput=True, echoCmd=False)
+        return path
+    elif wsl:
+        # Are we using Windows System for Linux? (untested)
+        path = runcmd('"{}" wslpath -a -u "{}"'.format(wsl, path), getOutput=True, echoCmd=False)
+        return path
+    else:
+        # Otherwise, do a simple translate and hope for the best?
+        # c:/foo --> /c/foo
+        # TODO: Check this!!
+        drive, rest = os.path.splitdrive(path)
+        path = '/{}/{}'.format(drive[0], rest)
+        return path
 
-    return None
 
+def bash2dosPath(path):
+    """
+    Convert an absolute unix-style path to one Windows can understand.
+    """
+    cygpath = which('cygpath')
+    wsl = which('wsl')
+
+    # If we have cygwin then we can use cygpath to convert the path.
+    # Note that MSYS2 (and Git Bash) now also have cygpath so this should
+    # work there too.
+    if cygpath:
+        path = runcmd('"{}" -w "{}"'.format(cygpath, path), getOutput=True, echoCmd=False)
+        return path
+    elif wsl:
+        # Are we using Windows System for Linux? (untested)
+        path = runcmd('"{}" wslpath -a -w "{}"'.format(wsl, path), getOutput=True, echoCmd=False)
+        return path
+    else:
+        # Otherwise, do a simple translate and hope for the best?
+        # /c/foo --> c:/foo
+        # There's also paths like /cygdrive/c/foo or /mnt/c/foo, but in those
+        # cases cygpath or wsl should be available.
+        components = path.split('/')
+        assert components[0] == '' and len(components[1]) == 1, "Expecting a path like /c/foo"
+        path = components[1] + ':/' + '/'.join(components[2:])
+        return path
+
+
+def do_regenerate_sysconfig():
+    """
+    If a Python environment has been relocated to a new folder then it's
+    possible that the sysconfig can still be usign paths for the original
+    location. Since wxPython's build uses WAF, which uses the sysconfig (via
+    python-config, distutils.sysconfig, etc.) then we need to ensure that these
+    paths match the current environment.
+
+    TODO: Can this be done in a way that doesn't require overwriting a file in
+    the environment?
+    """
+    with TemporaryDirectory() as td:
+        pwd = pushDir(td)
+
+        # generate a new sysconfig data file
+        cmd = [PYTHON, '-m', 'sysconfig', '--generate-posix-vars']
+        runcmd(cmd)
+
+        # On success the new data module will have been written to a subfolder
+        # of the current folder, which is recorded in ./pybuilddir.tx
+        with open('pybuilddir.txt', 'r') as fp:
+            pybd = fp.read()
+
+        # grab the file in that folder and copy it into the Python lib
+        p = opj(td, pybd, '*')
+        datafile = glob.glob(opj(td, pybd, '*'))[0]
+        cmd = [PYTHON, '-c', 'import sysconfig; print(sysconfig.get_path("stdlib"))']
+        stdlib = runcmd(cmd, getOutput=True)
+        shutil.copy(datafile, stdlib)
+
+        del pwd
+
+
+def _setTarItemPerms(tarinfo):
+    """
+    Used to set permissions of the files and fodlers in the source tarball
+    """
+    if tarinfo.isdir():
+        tarinfo.mode = 0o755
+    else:
+        tarinfo.mode |= 0o644
+    return tarinfo
 
 
 #---------------------------------------------------------------------------
@@ -833,14 +936,18 @@ def _doDox(arg):
     doxCmd = os.path.abspath(doxCmd)
 
     if isWindows:
-        cygwin_path = getCygwinPath()
-        doxCmd = doxCmd.replace('\\', '/')
-        doxCmd = runcmd(cygwin_path+'/bin/cygpath -u '+doxCmd, True, False)
+        bash = getBashPath()
+        if not bash:
+            raise RuntimeError("ERROR: Unable to find bash.exe, needed for running regen.sh")
+
+        doxCmd = dos2bashPath(doxCmd)
+        print(doxCmd)
         os.environ['DOXYGEN'] = doxCmd
         os.environ['WX_SKIP_DOXYGEN_VERSION_CHECK'] = '1'
+
         d = posixjoin(wxDir(), 'docs/doxygen')
         d = d.replace('\\', '/')
-        cmd = '%s/bin/bash.exe -l -c "cd %s && ./regen.sh %s"' % (cygwin_path, d, arg)
+        cmd = '"{}" -l -c "cd {} && ./regen.sh {}"'.format(bash, d, arg)
     else:
         os.environ['DOXYGEN'] = doxCmd
         os.environ['WX_SKIP_DOXYGEN_VERSION_CHECK'] = '1'
@@ -860,8 +967,6 @@ def cmd_doxhtml(options, args):
     _doDox('chm')
 
 
-# NOTE: Because of the use of defaults and plutil the following docset
-# commands will only work correctly on OSX.
 def cmd_docset_wx(options, args):
     cmdTimer = CommandTimer('docset_wx')
     cfg = Config()
@@ -880,32 +985,72 @@ def cmd_docset_wx(options, args):
         shutil.rmtree(destname)
     shutil.move(srcname, destname)
     shutil.copyfile(wxICON, posixjoin(destname, 'icon.png'))
-    runcmd('plutil -convert xml1 {}/Contents/Info.plist'.format(destname))
 
 
 def cmd_docset_py(options, args):
     cmdTimer = CommandTimer('docset_py')
+    cfg = Config(noWxConfig=True)
     if not os.path.isdir('docs/html'):
-        msg('ERROR: No docs/html, has the sphinx build command been run?')
+        msg('ERROR: No docs/html dir found, has the sphinx build command been run?')
         sys.exit(1)
 
     # clear out any old docset build
-    name = 'wxPython-{}'.format(version3)
+    name = 'wxPython-{}'.format(cfg.VERSION)
     docset = posixjoin('dist', '{}.docset'.format(name))
     if os.path.isdir(docset):
         shutil.rmtree(docset)
 
     # run the docset generator
     VERBOSE = '--verbose' if options.verbose else ''
-    runcmd('doc2dash {} --name "{}" --icon {} --destination dist docs/html'
-           .format(VERBOSE, name, pyICON))
+    URL = 'https://docs.wxpython.org/' if options.release else 'https://wxpython.org/Phoenix/docs/html/'
 
-    # update its Info.plist file
-    docset = os.path.abspath(docset)
-    runcmd('defaults write {}/Contents/Info isJavaScriptEnabled true'.format(docset))
-    runcmd('defaults write {}/Contents/Info dashIndexFilePath index.html'.format(docset))
-    runcmd('defaults write {}/Contents/Info DocSetPlatformFamily wxpy'.format(docset))
-    runcmd('plutil -convert xml1 {}/Contents/Info.plist'.format(docset))
+    cmd = [PYTHON, '-m doc2dash', VERBOSE,
+           '--name', name, '--icon', pyICON,
+           '--index-page index.html', '--enable-js',
+           '--online-redirect-url', URL,
+           '--destination dist docs/html']
+    runcmd(' '.join(cmd))
+
+    # Remove the sidebar from the pages in the docset
+    msg('Removing sidebar from docset pages...')
+    _removeSidebar(opj('dist', name+'.docset', 'Contents', 'Resources', 'Documents'))
+
+    # build the tarball
+    msg('Archiving Phoenix docset...')
+    rootname = "wxPython-docset-{}".format(cfg.VERSION)
+    tarfilename = "dist/{}.tar.gz".format(rootname)
+    if os.path.exists(tarfilename):
+        os.remove(tarfilename)
+    tarball = tarfile.open(name=tarfilename, mode="w:gz")
+    tarball.add(opj('dist', name+'.docset'), name+'.docset', filter=_setTarItemPerms)
+    tarball.close()
+
+    if options.upload:
+        uploadPackage(tarfilename, options)
+
+    msg("Docset file built at %s" % tarfilename)
+
+
+
+def _removeSidebar(path):
+    """
+    Remove the sidebar <div> from the pages going into the docset
+    """
+    from bs4 import BeautifulSoup
+    for filename in glob.glob(opj(path, '*.html')):
+        with textfile_open(filename, 'rt') as f:
+            text = f.read()
+        text = text.replace('<script src="_static/javascript/sidebar.js" type="text/javascript"></script>', '')
+        soup = BeautifulSoup(text, 'html.parser')
+        tag = soup.find('div', 'sphinxsidebar')
+        if tag:
+            tag.extract()
+        tag = soup.find('div', 'document')
+        if tag:
+            tag.attrs['class'] = ['document-no-sidebar']
+        text = unicode(soup) if PY2 else str(soup)
+        with textfile_open(filename, 'wt') as f:
+            f.write(text)
 
 
 def cmd_docset(options, args):
@@ -986,7 +1131,7 @@ def cmd_sphinx(options, args):
     pwd2 = pushDir(sphinxDir)
     buildDir = os.path.join(sphinxDir, 'build')
     htmlDir = os.path.join(phoenixDir(), 'docs', 'html')
-    runcmd('sphinx-build -b html -d %s/doctrees . %s' % (buildDir, htmlDir))
+    runcmd('{} -m sphinx -b html -d {}/doctrees . {}'.format(PYTHON, buildDir, htmlDir))
     del pwd2
 
     msg('Postprocessing sphinx output...')
@@ -996,7 +1141,7 @@ def cmd_sphinx(options, args):
 def cmd_wxlib(options, args):
     from sphinxtools.modulehunter import ModuleHunter
 
-    cmdTimer = CommandTimer('wx.lib')
+    cmdTimer = CommandTimer('wxlib')
     pwd = pushDir(phoenixDir())
 
     for wx_pkg in ['lib', 'py', 'tools']:
@@ -1037,7 +1182,7 @@ def cmd_bdist_docs(options, args):
 
     with tarfile.open(name=tarfilename, mode="w:gz") as tarball:
         tarball.add('docs/html', os.path.join(rootname, 'docs/html'),
-                    filter=lambda info: None if '.svn' in info.name else info)
+                    filter=_setTarItemPerms)
 
     if options.upload:
         uploadPackage(tarfilename, options, keep=5,
@@ -1181,7 +1326,9 @@ def cmd_sip(options, args):
 def cmd_touch(options, args):
     cmdTimer = CommandTimer('touch')
     pwd = pushDir(phoenixDir())
-    runcmd('touch etg/*.py')
+    etg = pathlib.Path('etg')
+    for item in etg.glob('*.py'):
+        item.touch()
 
 
 
@@ -1332,16 +1479,17 @@ def cmd_build_wx(options, args):
         traceback.print_exc()
         sys.exit(1)
 
-    # Build the wx message catalogs, but first check that there is a msgfmt
-    # command available
-    if findCmd('msgfmt'):
-        locale_pwd = pushDir(posixjoin(wxDir(), 'locale'))
-        print('Building message catalogs in ' + os.getcwd())
-        runcmd('make allmo')
-        del locale_pwd
-    else:
-        print("WARNING: msgfmt command not found, message catalogs not rebulit.\n"
-              "         Please install gettext and associated tools.")
+    if not options.no_allmo:
+        # Build the wx message catalogs, but first check that there is a msgfmt
+        # command available
+        if findCmd('msgfmt') and findCmd('make'):
+            locale_pwd = pushDir(posixjoin(wxDir(), 'locale'))
+            print('Building message catalogs in ' + os.getcwd())
+            runcmd('make allmo')
+            del locale_pwd
+        else:
+            print("WARNING: msgfmt and/or make commands not found, message catalogs not \n"
+                "         rebuilt. Please install gettext and associated tools.")
 
 
 
@@ -1371,9 +1519,9 @@ def copyWxDlls(options):
             dlls += glob.glob(os.path.join(cairo_root, arch, 'bin', '*.dll'))
 
         # For Python 3.5 and 3.6 builds we also need to copy some VC14 redist DLLs.
-        # NOTE: Do it for 3.7 too for now. But when we fully switch over to VS 2017
+        # NOTE: Do it for 3.7+ too for now. But when we fully switch over to VS 2017
         # this may need to change. See notes in wscript about it.
-        if PYVER in ['3.5', '3.6', '3.7']:
+        if PYVER in ['3.5', '3.6', '3.7', '3.8']:
             redist_dir = os.path.join(
                 phoenixDir(), 'packaging', 'Py3.5', 'vcredist',
                 arch, 'Microsoft.VC140.CRT', '*.dll')
@@ -1407,12 +1555,6 @@ def copyWxDlls(options):
 
         # If all went well the wxPython extensions should already be looking
         # for the wxlib's in $ORIGIN, so there is nothing else to do here
-
-
-# just an alias for build_py now
-def cmd_waf_py(options, args):
-    cmdTimer = CommandTimer('waf_py')
-    cmd_build_py(options, args)
 
 
 def cmd_build_py(options, args):
@@ -1480,10 +1622,27 @@ def cmd_build_py(options, args):
         # folder as the wxPython extension modules.
         os.environ['LD_RUN_PATH'] = '$ORIGIN'
 
+    # Regenerate the _sysconfigdata module?
+    if options.regenerate_sysconfig:
+        do_regenerate_sysconfig()
+
     # Run waf to perform the builds
     pwd = pushDir(phoenixDir())
     cmd = '"%s" %s %s configure build %s' % (PYTHON, waf, ' '.join(build_options), options.extra_waf)
-    runcmd(cmd)
+
+    def _onWafError():
+        if options.dump_waf_log:
+            logfilename = opj(wafBuildDir, 'config.log')
+            if not os.path.exists(logfilename):
+                msg('WARNING: waf log "{}" not found!'.format(logfilename))
+                return
+
+            msg('*-'*40)
+            msg('WAF config log "{}":'.format(logfilename))
+            with open(logfilename, 'r') as log:
+                msg(log.read())
+            msg('*-'*40)
+    runcmd(cmd, onError=_onWafError)
 
     if isWindows and options.both:
         build_options.remove('--debug')
@@ -1818,11 +1977,22 @@ def cmd_sdist(options, args):
     if not os.path.exists('dist'):
         os.mkdir('dist')
 
-    # pull out an archive copy of the repo files
-    msg('Exporting Phoenix...')
-    runcmd('git archive HEAD | tar -x -C %s' % PDEST, echoCmd=False)
-    msg('Exporting wxWidgets...')
-    runcmd('(cd %s; git archive HEAD) | tar -x -C %s' % (WSRC, WDEST), echoCmd=False)
+    # recursivly export a git archive of this repo and submodules
+    def _archive_submodules(root, dest):
+        msg('Exporting {}...'.format(root))
+        if not os.path.exists(dest):
+            os.path.makedirs(dest)
+        pwd = pushDir(root)
+        runcmd('git archive HEAD | tar -x -C %s' % dest, echoCmd=False)
+
+        if os.path.exists('.gitmodules'):
+            for line in open('.gitmodules', 'rt').readlines():
+                line = line.strip()
+                if line.startswith('path = '):
+                    sub = line[7:]
+                    _archive_submodules(sub, opj(dest, sub))
+
+    _archive_submodules('.', os.path.abspath(PDEST))
 
     # copy Phoenix's generated code into the archive tree
     msg('Copying generated files...')
@@ -1874,7 +2044,7 @@ def cmd_sdist(options, args):
     tarball = tarfile.open(name=tarfilename, mode="w:gz")
     pwd = pushDir(PDEST)
     for name in glob.glob('*'):
-        tarball.add(name, os.path.join(rootname, name))
+        tarball.add(name, os.path.join(rootname, name), filter=_setTarItemPerms)
     tarball.close()
     msg('Cleaning up...')
     del pwd
@@ -1926,7 +2096,7 @@ def cmd_sdist_demo(options, args):
     tarball = tarfile.open(name=tarfilename, mode="w:gz")
     pwd = pushDir(PDEST)
     for name in glob.glob('*'):
-        tarball.add(name, os.path.join(rootname, name))
+        tarball.add(name, os.path.join(rootname, name), filter=_setTarItemPerms)
     tarball.close()
     msg('Cleaning up...')
     del pwd

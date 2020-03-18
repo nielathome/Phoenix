@@ -280,10 +280,8 @@ def main(wxDir, args):
                 configure_opts.append("--with-gtk=2")
 
         wxpy_configure_opts = [
-                            "--with-opengl",
                             "--enable-sound",
                             "--enable-graphics_ctx",
-                            "--enable-mediactrl",
                             "--enable-display",
                             "--enable-geometry",
                             "--enable-debug_flag",
@@ -294,8 +292,7 @@ def main(wxDir, args):
                             ]
 
         if sys.platform.startswith("darwin"):
-            #wxpy_configure_opts.append("--enable-monolithic")
-            pass
+            wxpy_configure_opts.append("--disable-qtkit")
         else:
             wxpy_configure_opts.append("--with-sdl")
 
@@ -303,16 +300,16 @@ def main(wxDir, args):
         # version present on the build machine.
         # TODO: should there be a command line option to set the SDK?
         if sys.platform.startswith("darwin"):
-            wxpy_configure_opts.append("--with-macosx-version-min=10.6")
-            for xcodePath in getXcodePaths():
-                sdks = [ xcodePath+"/SDKs/MacOSX10.{}.sdk".format(n)
-                         for n in range(6, 15) ]
-                # use the lowest available sdk on the build machine
-                for sdk in sdks:
-                    if os.path.exists(sdk):
-                        wxpy_configure_opts.append(
-                            "--with-macosx-sdk=%s" % sdk)
-                        break
+            wxpy_configure_opts.append("--with-macosx-version-min=10.9")
+            # for xcodePath in getXcodePaths():
+            #     sdks = [ xcodePath+"/SDKs/MacOSX10.{}.sdk".format(n)
+            #              for n in range(9, 15) ]
+            #     # use the lowest available sdk on the build machine
+            #     for sdk in sdks:
+            #         if os.path.exists(sdk):
+            #             wxpy_configure_opts.append(
+            #                 "--with-macosx-sdk=%s" % sdk)
+            #             break
 
         if not options.mac_framework:
             if installDir and not prefixDir:

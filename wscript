@@ -10,8 +10,13 @@
 import sys
 import os
 
-import buildtools.config
-cfg = buildtools.config.Config(True)
+try:
+    from textwrap import indent
+except ImportError:
+    from buildtools.backports.textwrap3 import indent
+
+from buildtools.config import Config, runcmd, msg
+cfg = Config(True)
 
 #-----------------------------------------------------------------------------
 # Options and configuration
@@ -79,7 +84,12 @@ def configure(conf):
             # On the other hand, microsoft says that v141 and v140 (Visual
             # Studio 2015) are binary compatible, so for now let's just drop
             # it back to "14.0" until I get all the details worked out for
-            # using VS 2017 everywhere for Python 3.7.
+            # using VS 2017 everywhere for Python 3.7+.
+            msvc_version = '14.0'
+
+        # In some cases (Azure DevOps at least) we're getting "14.1" for Python
+        # 3.6 too. Smash it down to '14.0'
+        if msvc_version == "14.1" and sys.version_info[:2] == (3,6):
             msvc_version = '14.0'
 
         conf.env['MSVC_VERSIONS'] = ['msvc ' + msvc_version]
@@ -95,9 +105,10 @@ def configure(conf):
     if isWindows:
         # Search for the Python headers without doing some stuff that could
         # incorrectly fail on Windows. See my_check_python_headers below.
+        # TODO: Check if it can/should be used on other platforms too.
         conf.my_check_python_headers()
     else:
-        conf.check_python_headers()
+        conf.check_python_headers(features='pyext')
 
     # fetch and save the debug options
     conf.env.debug = conf.options.debug
@@ -181,6 +192,9 @@ def configure(conf):
 
 
     else:
+        # TODO: Double-check that this works when using an installed wxWidgets
+        wxConfigDir = cfg.findWxConfigDir(conf.options.wx_config)
+
         # Configuration stuff for non-Windows ports using wx-config
         conf.env.CFLAGS_WX   = list()
         conf.env.CXXFLAGS_WX = list()
@@ -216,13 +230,21 @@ def configure(conf):
                        uselib_store='WXHTML', mandatory=True,
                        msg='Finding libs for WXHTML')
 
+        if cfg.checkSetup(wxConfigDir, 'wxUSE_GLCANVAS'):
+            gl_libs = '--libs gl,core,net'
+        else:
+            gl_libs = '--libs core,net'
         conf.check_cfg(path=conf.options.wx_config, package='',
-                       args='--cxxflags --libs gl,core,net' + rpath,
+                       args='--cxxflags ' + gl_libs + rpath,
                        uselib_store='WXGL', mandatory=True,
                        msg='Finding libs for WXGL')
 
+        if cfg.checkSetup(wxConfigDir, 'wxUSE_WEBVIEW'):
+            wv_libs = '--libs webview,core,net'
+        else:
+            wv_libs = '--libs core,net'
         conf.check_cfg(path=conf.options.wx_config, package='',
-                       args='--cxxflags --libs webview,core,net' + rpath,
+                       args='--cxxflags ' + wv_libs + rpath,
                        uselib_store='WXWEBVIEW', mandatory=True,
                        msg='Finding libs for WXWEBVIEW')
 
@@ -242,14 +264,18 @@ def configure(conf):
                        uselib_store='WXXRC', mandatory=True,
                        msg='Finding libs for WXXRC')
 
-        libname = '' if cfg.MONOLITHIC else 'richtext,' # workaround bug in wx-config
+        libname = '' if cfg.MONOLITHIC else 'richtext,adv,' # workaround bug in wx-config
         conf.check_cfg(path=conf.options.wx_config, package='',
                        args='--cxxflags --libs %score,net' % libname + rpath,
                        uselib_store='WXRICHTEXT', mandatory=True,
                        msg='Finding libs for WXRICHTEXT')
 
+        if cfg.checkSetup(wxConfigDir, 'wxUSE_MEDIACTRL'):
+            mc_libs = '--libs media,core,net'
+        else:
+            mc_libs = '--libs core,net'
         conf.check_cfg(path=conf.options.wx_config, package='',
-                       args='--cxxflags --libs media,core,net' + rpath,
+                       args='--cxxflags ' + mc_libs + rpath,
                        uselib_store='WXMEDIA', mandatory=True,
                        msg='Finding libs for WXMEDIA')
 
@@ -305,8 +331,8 @@ def configure(conf):
 
         # And if --debug is set turn on more detailed debug info and turn off optimization
         if conf.env.debug:
-            conf.env.CFLAGS_WXPY.extend(['-ggdb', '-O0'])
-            conf.env.CXXFLAGS_WXPY.extend(['-ggdb', '-O0'])
+            for flags in [conf.env.CFLAGS_PYEXT, conf.env.CXXFLAGS_PYEXT]:
+                flags.extend(['-ggdb', '-O0'])
 
         # Remove some compile flags we don't care about, ones that we may be
         # replacing ourselves anyway, or ones which may have duplicates.
@@ -518,6 +544,12 @@ def build(bld):
 
     cfg.finishSetup(bld.env.wx_config)
 
+    if not isWindows:
+        cmd = ' '.join(bld.env.CC) + ' --version'
+        copmpiler = runcmd(cmd, getOutput=True, echoCmd=False)
+        copmpiler = indent(copmpiler, ' '*5)
+        msg("**** Compiler: {}\n{}".format(cmd, copmpiler))
+
     # Copy the license files from wxWidgets
     updateLicenseFiles(cfg)
 
@@ -545,6 +577,8 @@ def build(bld):
     for name in ['src/__init__.py', 'src/gizmos.py',]:
         copy_file(name, cfg.PKGDIR, update=1, verbose=1)
 
+    # Copy sip's sip.h for distribution with wxPython's header
+    copy_file('sip/siplib/sip.h', 'wx/include/wxPython', update=1, verbose=1)
 
     # Create the build tasks for each of our extension modules.
     addRelwithdebugFlags(bld, 'siplib')
@@ -642,6 +676,15 @@ def copyFileToPkg(task):
     return 0
 
 
+def simpleCopy(task):
+    import shutil
+    src = task.inputs[0].abspath()
+    tgt = task.outputs[0].abspath()
+    print("{} --> {}".format(src, tgt))
+    shutil.copy(src, tgt)
+    return 0
+
+
 # Copy all the items in env with a matching postfix to a similarly
 # named item with the dest postfix.
 def _copyEnvGroup(env, srcPostfix, destPostfix):
@@ -657,7 +700,17 @@ def makeETGRule(bld, etgScript, moduleName, libFlags):
     from buildtools.config   import loadETG, getEtgSipCppFiles
 
     addRelwithdebugFlags(bld, moduleName)
-    rc = ['src/wxc.rc'] if isWindows else []
+
+    rc = []
+    if isWindows:
+        rc_name = moduleName + '.rc'
+        bld(rule=simpleCopy,
+            source='src/wxc.rc',
+            target=rc_name,
+            #before=moduleName+'.res'
+            )
+        rc = [rc_name]
+
     etg = loadETG(etgScript)
     bld(features='c cxx cxxshlib pyext',
         target=makeTargetName(bld, moduleName),

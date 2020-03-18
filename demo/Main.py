@@ -361,6 +361,36 @@ def FindImages(text, widgetName):
     return winAppearance
 
 
+def GetCaretPeriod(win = None):
+    """
+    Attempts to identify the correct caret blinkrate to use in the Demo Code panel.
+
+    :pram wx.Window win: a window to pass to wx.SystemSettings.GetMetric.
+
+    :return: a value in milliseconds that indicates the proper period.
+    :rtype: int
+
+    :raises: ValueError if unable to resolve a proper caret blink rate.
+    """
+    if '--no-caret-blink' in sys.argv:
+        return 0
+
+    try:
+        onmsec  = wx.SystemSettings.GetMetric(wx.SYS_CARET_ON_MSEC, win)
+        offmsec = wx.SystemSettings.GetMetric(wx.SYS_CARET_OFF_MSEC, win)
+
+        # check values aren't -1
+        if -1 in (onmsec, offmsec):
+            raise ValueError("Unable to determine caret blink rate.")
+
+        # attempt to average.
+        # (wx systemsettings allows on and off time, but scintilla just takes a single period.)
+        return (onmsec + offmsec) / 2.0
+
+    except AttributeError:
+        # Issue where wx.SYS_CARET_ON/OFF_MSEC is unavailable.
+        raise ValueError("Unable to determine caret blink rate.")
+
 #---------------------------------------------------------------------------
 # Set up a thread that will scan the wxWidgets docs for window styles,
 # events and widgets screenshots
@@ -611,6 +641,12 @@ try:
             self.SetCaretForeground("BLUE")
             # Selection background
             self.SetSelBackground(1, '#66CCFF')
+
+            # Attempt to set caret blink rate.
+            try:
+                self.SetCaretPeriod(GetCaretPeriod(self))
+            except ValueError:
+                pass
 
             self.SetSelBackground(True, wx.SystemSettings.GetColour(wx.SYS_COLOUR_HIGHLIGHT))
             self.SetSelForeground(True, wx.SystemSettings.GetColour(wx.SYS_COLOUR_HIGHLIGHTTEXT))
@@ -932,7 +968,8 @@ def SearchDemo(name, keyword):
     fullText = fid.read()
     fid.close()
 
-    fullText = fullText.decode("iso-8859-1")
+    if six.PY2:
+        fullText = fullText.decode("iso-8859-1")
 
     if fullText.find(keyword) >= 0:
         return True
@@ -1492,6 +1529,14 @@ class wxPythonDemo(wx.Frame):
         self.filter.Bind(wx.EVT_SEARCHCTRL_CANCEL_BTN,
                          lambda e: self.filter.SetValue(''))
         self.filter.Bind(wx.EVT_TEXT_ENTER, self.OnSearch)
+
+        if 'gtk3' in wx.PlatformInfo:
+            # Something is wrong with the bestsize of the SearchCtrl, so for now
+            # let's set it based on the size of a TextCtrl.
+            txt = wx.TextCtrl(leftPanel)
+            bs = txt.GetBestSize()
+            txt.DestroyLater()
+            self.filter.SetMinSize((-1, bs.height+4))
 
         searchMenu = wx.Menu()
         item = searchMenu.AppendRadioItem(-1, "Sample Name")

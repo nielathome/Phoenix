@@ -50,7 +50,7 @@ HOWTO Release wxPython Phoenix
 13. Upload to PyPI with::
 
         cd ~/release-builds
-        twine upload wxPython-4*
+        twine upload -u robind wxPython-4*
 
     (Twine doesn't know what to do with the docs and other files so they need
     to be excluded by the wildcard.)
@@ -61,6 +61,14 @@ HOWTO Release wxPython Phoenix
 
     TODO: Automate this!
     Go to the site and unpack the new docs into the document root.
+
+        cd domains/docs.wxpython.org/htdocs
+        mkdir {OLD_VERSION}
+        mv .buildinfo [_a-z]* {OLD_VERSION}
+        tar xzvf ../tmp/wxPython-docs-*
+        mv wxPython-docs-*/docs/html/* .
+        mv wxPython-docs-*/docs/html/.buildinfo .
+        rm -r wxPython-docs-*
 
 15. Upload the docs, demos and pdb archive files to extras.wxpython.org/wxPython4/extras/::
 

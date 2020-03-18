@@ -9,6 +9,7 @@
 
 import etgtools
 import etgtools.tweaker_tools as tools
+from etgtools import MethodDef, ParamDef
 
 PACKAGE   = "wx"
 MODULE    = "_html"
@@ -47,6 +48,8 @@ def run():
     tools.fixHtmlSetFonts(c)
 
     c.find('AddFilter.filter').transfer = True
+    c.find('OnOpeningURL.redirect').out = True
+    c.find('OnOpeningURL.redirect').name = 'redirectTo'
 
     # Turn the virtual flag back on for some methods
     for name in [ 'OnLinkClicked',
@@ -74,6 +77,14 @@ def run():
         virtual void SetHTMLStatusText(const wxString& text);
         virtual wxCursor GetHTMLCursor(wxHtmlWindowInterface::HTMLCursor type) const;
         """))
+
+    m = MethodDef(name='ScrollToAnchor', type='bool', protection='protected',
+        items=[ParamDef(type='const wxString&', name='anchor')],
+        doc="""\
+            Scrolls to anchor of this name.
+            Returns True is anchor exists, False otherwise.
+        """)
+    c.addItem(m)
 
 
     c = module.find('wxHtmlLinkEvent')
